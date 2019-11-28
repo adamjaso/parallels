@@ -15,28 +15,11 @@
 #define NPROC_DEFAULT 8
 #define NPROC_MIN 2
 #define NPROC_MAX 64
-#define WORKER_ARG_SIZE 1024
 #define ENV_WORKER_ARG "WORKER_ARG"
 #define ENV_WORKER_PID "WORKER_PID"
 #define ENV_WORKER_INDEX "WORKER_INDEX"
-
-void show_usage(char *msg) {
-    dprintf(STDERR_FILENO,
-            "%s"                                                                             \
-            "Usage: parallels [-n NUM_PROCESSES] [-v] -- CMD [ARG ...]\n"                    \
-            "  Note that each line read from STDIN must be less than or equal to %d bytes\n" \
-            "\n"                                                                             \
-            "  -n NUM_PROCESSES\n"                                                           \
-            "     Indicates the integer number of worker processes\n"                        \
-            "     Must be greater than or equal to %d and less than or equal to %d\n"        \
-            "     Default is %d\n"                                                           \
-            "  -v\n"                                                                         \
-            "     Enable verbose logging of worker activity to STDERR\n"                     \
-            "  CMD\n"                                                                        \
-            "     Command each worker should exec against each line of input\n"              \
-            "  ARG\n"                                                                        \
-            "     Optional arguments to be passed along with CMD\n", msg, WORKER_ARG_SIZE, NPROC_MIN, NPROC_MAX, NPROC_DEFAULT);
-}
+#define WORKER_ARG_BUFSIZE 1024
+#define WORKER_ARG_SIZE WORKER_ARG_BUFSIZE - strlen(ENV_WORKER_ARG) - 1 - 1
 
 struct args_t {
     int nproc;
@@ -52,7 +35,7 @@ int args_parse(int argc, char **argv, struct args_t *args);
 
 // worker
 
-void worker_wait(pid_t pid, int quiet);
+void worker_wait(pid_t pid, char *prefix, int verbose);
 void worker_start(struct args_t *args);
 void worker_child(struct args_t *args, int index);
 
@@ -80,7 +63,7 @@ struct env_t {
     char **env;
     char worker_index[32];
     char worker_pid[32];
-    char worker_arg[WORKER_ARG_SIZE];
+    char worker_arg[WORKER_ARG_BUFSIZE];
 };
 
 int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid, char *worker_arg);
@@ -89,6 +72,8 @@ void env_count(char **env, int *count);
 void env_show(char **env);
 
 // main
+
+void show_usage(char *msg);
 
 int main(int argc, char **argv) {
     struct args_t args;
@@ -101,41 +86,60 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+void show_usage(char *msg) {
+    // buffer_size - worker_arg_name - equals_char - NUL
+    dprintf(STDERR_FILENO,
+            "%s"                                                                                \
+            "Usage: parallels [-n NUM_PROCESSES] [-v] -- CMD [ARG ...]\n"                       \
+            "  Note that each line read from STDIN must be less than or equal to %ld bytes\n"   \
+            "\n"                                                                                \
+            "  -n NUM_PROCESSES\n"                                                              \
+            "     Indicates the integer number of worker processes\n"                           \
+            "     Must be greater than or equal to %d and less than or equal to %d\n"           \
+            "     Default is %d\n"                                                              \
+            "  -v\n"                                                                            \
+            "     Enable verbose logging of worker activity to STDERR\n"                        \
+            "  CMD\n"                                                                           \
+            "     Command each worker should exec against each line of STDIN\n"                 \
+            "  ARG\n"                                                                           \
+            "     Optional arguments to be passed along with CMD\n",
+            msg, WORKER_ARG_SIZE, NPROC_MIN, NPROC_MAX, NPROC_DEFAULT);
+}
+
+// worker
+
 void worker_start(struct args_t *args) {
-    // declare
     pid_t *pid;
     int *wqs;
     char *prefix = "main : ";
     struct reader_t reader;
     fd_set wfds, wfds2;
-    struct timeval timeout;
     int i, ret, nfds, last_i;
 
-    // assign
     FD_ZERO(&wfds);
     FD_ZERO(&wfds2);
     pid = calloc(args->nproc, sizeof (pid_t));
     wqs = calloc(args->nproc, sizeof (int));
 
-    // start
     for (i = 0; i < args->nproc; i++) {
         int queue[2];
         ret = pipe(queue);
+        if (args->verbose) dprintf(STDERR_FILENO, "%s starting worker %d...\n", prefix, i);
         if (ret == -1) {
-            dprintf(STDERR_FILENO, "pipe %d\n", errno);
+            dprintf(STDERR_FILENO, "%s starting worker %d failed with pipe error %d\n", prefix, i, errno);
             break;
         }
-        if (args->verbose) dprintf(STDERR_FILENO, "worker %d starting...\n", i);
         wqs[i] = queue[1];
         nfds = queue[1] + 1;
         FD_SET(queue[1], &wfds);            // watch write fd
         ret = fork();
         if (ret < 0) {
-            dprintf(STDERR_FILENO, "failed to fork %d with error %d\n", i, errno);
+            dprintf(STDERR_FILENO, "%s starting worker %d failed with fork error %d\n", prefix, i, errno);
             break;
 
         } else if (ret > 0) {
             // parent
+            if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d forked with pid %d\n", prefix, i, ret);
             close(queue[0]);                // close read fd
             pid[i] = ret;
 
@@ -157,15 +161,16 @@ void worker_start(struct args_t *args) {
             wfds2 = wfds;                                   // reset watched fds
             ret = select(nfds, NULL, &wfds2, NULL, NULL);   // wait for available worker
             if (ret <= 0) {                                 // check for error or timeout
-                if (ret < 0) dprintf(STDERR_FILENO, "select %d\n", errno);  // we have an error while waiting
+                if (ret < 0) dprintf(STDERR_FILENO, "%s select got error %d\n", prefix, errno);  // we have an error while waiting
                 continue;
             }
             // worker available! find the worker...
             for (i = 0; i < args->nproc; i++, last_i = (last_i++) % args->nproc) {
                 if (FD_ISSET(wqs[last_i], &wfds2)) {
                     // found worker! write line to it...
+                    if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d write...\n", prefix, last_i);
                     if (write(wqs[last_i], reader.line, reader.nread) == -1) {
-                        dprintf(STDERR_FILENO, "write %d errno %d\n", wqs[last_i], errno);
+                        dprintf(STDERR_FILENO, "%s worker %d write error %d\n", prefix, last_i, errno);
                     }
                     last_i ++;
                     break;
@@ -177,16 +182,14 @@ void worker_start(struct args_t *args) {
 
         // close write fds
         for (i = 0; i < args->nproc; i++) {
-            if (args->verbose) dprintf(STDERR_FILENO, "worker %d closing...\n", i);
-            if (close(wqs[i]) == -1) {
-                dprintf(STDERR_FILENO, "worker %d (%d) close error %d\n", i, pid[i], errno);
-            }
+            if (args->verbose)       dprintf(STDERR_FILENO, "%s worker %d close...\n", prefix, i);
+            if (close(wqs[i]) == -1) dprintf(STDERR_FILENO, "%s worker %d close error %d\n", prefix, i, errno);
         }
 
         // wait for workers to exit
         for (i = 0; i < args->nproc; i++) {
-            if (args->verbose) dprintf(STDERR_FILENO, "worker %d (%d) wait...\n", i, pid[i]);
-            worker_wait(pid[i], !args->verbose);
+            if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d (%d) wait...\n", prefix, i, pid[i]);
+            worker_wait(pid[i], prefix, args->verbose);
         }
     }
 
@@ -200,19 +203,23 @@ void worker_child(struct args_t *args, int i) {
     pid_t child, worker_pid;
 
     worker_pid = getpid();
-    sprintf(prefix, "worker %d (%d) :", i, getpid());
+    sprintf(prefix, "worker %d :", i);
 
-    if (args->verbose) dprintf(STDERR_FILENO, "worker %d started!\n", i);
+    if (args->verbose) dprintf(STDERR_FILENO, "%s started!\n", prefix);
     reader_init(&reader, prefix, stdin);
     while (!reader_read(&reader)) {
+        struct env_t env;
+        if (strlen(reader.line) > WORKER_ARG_SIZE) {
+            dprintf(STDERR_FILENO, "%s %s is too large (%ld bytes)\n", prefix, ENV_WORKER_ARG, strlen(reader.line));
+            continue;
+        }
+        env_init(&env, args->nenv, i, worker_pid, reader.line);
         child = fork();
         if (child < 0) {
-            dprintf(STDERR_FILENO, "%s failed to process %s with error %d\n", prefix, reader.line, errno);
+            dprintf(STDERR_FILENO, "%s fork error %d\n", prefix, errno);
         } else if (child > 0) {
-            worker_wait(child, 1);
+            worker_wait(child, prefix, args->verbose);
         } else {
-            struct env_t env;
-            env_init(&env, args->nenv, i, worker_pid, reader.line);
             execve(args->cmd[0], args->cmd, env.env);
             env_destroy(&env);
         }
@@ -247,6 +254,10 @@ void args_show(struct args_t *args) {
 }
 
 int args_parse(int argc, char **argv, struct args_t *args) {
+    int ncmd;
+
+    ncmd = 0;
+
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) {
             // we found cmd
@@ -254,9 +265,8 @@ int args_parse(int argc, char **argv, struct args_t *args) {
                 show_usage("-- a command must follow\n");
                 return -1;
             }
-            int j;
-            for (j = 0; i < argc; j++) args->cmd[j] = argv[++i];
-            args->cmd[j - 1] = NULL;
+            for (ncmd = 0; i < argc; ncmd++) args->cmd[ncmd] = argv[++i];
+            args->cmd[ncmd - 1] = NULL;
             break;
 
         } else if (strcmp(argv[i], "-n") == 0) {
@@ -273,10 +283,16 @@ int args_parse(int argc, char **argv, struct args_t *args) {
         } else if (strcmp(argv[i], "-v") == 0) {
             // we found verbose
             args->verbose = 1;
-        } else if (strcmp(argv[i], "-h") == 0) {
+
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            // we found help
             show_usage("");
             exit(EXIT_SUCCESS);
         }
+    }
+    if (ncmd < 2) {
+        show_usage("CMD is required\n");
+        return -1;
     }
     return 0;
 }
@@ -300,7 +316,7 @@ int reader_read(struct reader_t *reader) {
             reader->done = 1;
             if (errno != 0) {
                 reader->err = errno;
-                dprintf(STDERR_FILENO, "getline %d", errno);
+                dprintf(STDERR_FILENO, "getline %d\n", errno);
             }
         }
     }
@@ -331,11 +347,6 @@ void reader_show(struct reader_t *reader) {
 // env
 
 int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid, char *worker_arg) {
-    if (strlen(worker_arg) + strlen(ENV_WORKER_ARG) + 1 > WORKER_ARG_SIZE) {
-        dprintf(STDERR_FILENO, "%s is too large\n", ENV_WORKER_ARG);
-        return -1;
-    }
-
     char **e;
     int i;
 
@@ -370,23 +381,20 @@ void env_count(char **env, int *count) {
 
 // worker
 
-void worker_wait(pid_t pid, int quiet) {
+void worker_wait(pid_t pid, char *prefix, int verbose) {
     // parent
     pid_t wstatus;
     waitpid(pid, &wstatus, 0);
-    if (quiet) return;
+    if (!verbose) return;
     if (WIFEXITED(wstatus)) {
-        dprintf(STDERR_FILENO, "worker %d exited with status %d\n", pid, WEXITSTATUS(wstatus));
-        //exit(EXIT_SUCCESS);
+        dprintf(STDERR_FILENO, "%s pid %d exited with status %d\n", prefix, pid, WEXITSTATUS(wstatus));
     } else if (WIFSIGNALED(wstatus)) {
-        dprintf(STDERR_FILENO, "worker %d killed by signal %d%s\n", pid, WTERMSIG(wstatus), WCOREDUMP(wstatus) ? " (dumped core)" : "");
-        //exit(EXIT_FAILURE);
+        dprintf(STDERR_FILENO, "%s pid %d killed by signal %d%s\n", prefix, pid, WTERMSIG(wstatus), WCOREDUMP(wstatus) ? " (dumped core)" : "");
     } else if (WIFSTOPPED(wstatus)) {
-        dprintf(STDERR_FILENO, "worker %d stopped by signal %d\n", pid, WSTOPSIG(wstatus));
+        dprintf(STDERR_FILENO, "%s pid %d stopped by signal %d\n", prefix, pid, WSTOPSIG(wstatus));
     } else if (WIFCONTINUED(wstatus)) {
-        dprintf(STDERR_FILENO, "worker %d continued\n", pid);
+        dprintf(STDERR_FILENO, "%s pid %d continued\n", prefix, pid);
     } else {
-        dprintf(STDERR_FILENO, "worker %d exited with unknown status %d\n", pid, wstatus);
-        //exit(EXIT_FAILURE);
+        dprintf(STDERR_FILENO, "%s pid %d exited with unknown status %d\n", prefix, pid, wstatus);
     }
 }
