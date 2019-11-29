@@ -91,8 +91,24 @@ void show_usage(char *msg) {
     dprintf(STDERR_FILENO,
             "%s"                                                                                \
             "Usage: parallels [-n NUM_PROCESSES] [-v] -- CMD [ARG ...]\n"                       \
-            "  Note that each line read from STDIN must be less than or equal to %ld bytes\n"   \
             "\n"                                                                                \
+            "Job runner that reads lines from STDIN and passes them to parallel worker\n"       \
+            "processes that invoke a user-defined script against each line.\n"                  \
+            "\n"                                                                                \
+            "When a worker receives a job, it forks and executes the command (CMD + ARG), \n"   \
+            "passing the job as an environment variable (WORKER_ARG). A full list of worker\n"  \
+            "environment variables is listed below.\n"                                          \
+            "\n"                                                                                \
+            "Note that each line read from STDIN must be less than or equal to %ld bytes\n"     \
+            "\n"                                                                                \
+            "The worker invokes the user-defined script with the following environment\n"       \
+            "variables\n"                                                                       \
+            "  - all existing environment variables\n"                                          \
+            "  - WORKER_ARG    the line from STDIN\n"                                           \
+            "  - WORKER_INDEX  the index of the worker running the job\n"                       \
+            "  - WORKER_PID    the pid of the worker running the job\n"                         \
+            "\n"                                                                                \
+            "Arguments:\n"                                                                      \
             "  -n NUM_PROCESSES\n"                                                              \
             "     Indicates the integer number of worker processes\n"                           \
             "     Must be greater than or equal to %d and less than or equal to %d\n"           \
@@ -102,7 +118,15 @@ void show_usage(char *msg) {
             "  CMD\n"                                                                           \
             "     Command each worker should exec against each line of STDIN\n"                 \
             "  ARG\n"                                                                           \
-            "     Optional arguments to be passed along with CMD\n",
+            "     Optional arguments to be passed along with CMD\n"                             \
+            "\n"                                                                                \
+            "Examples:\n"                                                                       \
+            "  $ cat urls.txt | parallels -n 16 -- \\\n"                                        \
+            "      /bin/sh -c 'curl $WORKER_ARG > $(basename $WORKER_ARG)'\n"                   \
+            "\n"                                                                                \
+            "  Each line in urls.txt is a URL to download, and the worker will download up\n"   \
+            "  to 16 URLs in parallel.\n"
+            ,
             msg, WORKER_ARG_SIZE, NPROC_MIN, NPROC_MAX, NPROC_DEFAULT);
 }
 
