@@ -26,3 +26,7 @@ passed to it, respectively.
 This program starts `n` workers and reads `stdin` line by line, sending each line
 to one of the worker processes which `execve`s a user specified script passing
 the line as an `environ` variable to the script.
+
+## License
+
+MIT

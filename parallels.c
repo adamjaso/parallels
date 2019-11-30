@@ -1,3 +1,24 @@
+/*
+ * Copyright 2019 Adam Jaso
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,8 +154,8 @@ void show_usage(char *msg) {
 // worker
 
 void worker_start(struct args_t *args) {
-    pid_t *pid;
-    int *wqs;
+    pid_t *worker_pids;
+    int *worker_fds;
     char *prefix = "main : ";
     struct reader_t reader;
     fd_set wfds, wfds2;
@@ -142,8 +163,8 @@ void worker_start(struct args_t *args) {
 
     FD_ZERO(&wfds);
     FD_ZERO(&wfds2);
-    pid = calloc(args->nproc, sizeof (pid_t));
-    wqs = calloc(args->nproc, sizeof (int));
+    worker_pids = calloc(args->nproc, sizeof (pid_t));
+    worker_fds = calloc(args->nproc, sizeof (int));
 
     for (i = 0; i < args->nproc; i++) {
         int queue[2];
@@ -153,7 +174,7 @@ void worker_start(struct args_t *args) {
             dprintf(STDERR_FILENO, "%s starting worker %d failed with pipe error %d\n", prefix, i, errno);
             break;
         }
-        wqs[i] = queue[1];
+        worker_fds[i] = queue[1];
         nfds = queue[1] + 1;
         FD_SET(queue[1], &wfds);            // watch write fd
         ret = fork();
@@ -165,7 +186,7 @@ void worker_start(struct args_t *args) {
             // parent
             if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d forked with pid %d\n", prefix, i, ret);
             close(queue[0]);                // close read fd
-            pid[i] = ret;
+            worker_pids[i] = ret;
 
         } else {
             // child
@@ -190,10 +211,10 @@ void worker_start(struct args_t *args) {
             }
             // worker available! find the worker...
             for (i = 0; i < args->nproc; i++, last_i = (last_i++) % args->nproc) {
-                if (FD_ISSET(wqs[last_i], &wfds2)) {
+                if (FD_ISSET(worker_fds[last_i], &wfds2)) {
                     // found worker! write line to it...
                     if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d write...\n", prefix, last_i);
-                    if (write(wqs[last_i], reader.line, reader.nread) == -1) {
+                    if (write(worker_fds[last_i], reader.line, reader.nread) == -1) {
                         dprintf(STDERR_FILENO, "%s worker %d write error %d\n", prefix, last_i, errno);
                     }
                     last_i ++;
@@ -207,25 +228,27 @@ void worker_start(struct args_t *args) {
         // close write fds
         for (i = 0; i < args->nproc; i++) {
             if (args->verbose)       dprintf(STDERR_FILENO, "%s worker %d close...\n", prefix, i);
-            if (close(wqs[i]) == -1) dprintf(STDERR_FILENO, "%s worker %d close error %d\n", prefix, i, errno);
+            if (close(worker_fds[i]) == -1) dprintf(STDERR_FILENO, "%s worker %d close error %d\n", prefix, i, errno);
         }
 
         // wait for workers to exit
         for (i = 0; i < args->nproc; i++) {
-            if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d (%d) wait...\n", prefix, i, pid[i]);
-            worker_wait(pid[i], prefix, args->verbose);
+            if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d (%d) wait...\n", prefix, i, worker_pids[i]);
+            worker_wait(worker_pids[i], prefix, args->verbose);
         }
     }
 
-    free(pid);
-    free(wqs);
+    free(worker_pids);
+    free(worker_fds);
 }
 
 void worker_child(struct args_t *args, int i) {
     struct reader_t reader;
     char *prefix = calloc(32, sizeof (char));
     pid_t child, worker_pid;
+    int ret, exit_status;
 
+    exit_status = 0;
     worker_pid = getpid();
     sprintf(prefix, "worker %d :", i);
 
@@ -244,14 +267,21 @@ void worker_child(struct args_t *args, int i) {
         } else if (child > 0) {
             worker_wait(child, prefix, args->verbose);
         } else {
-            execve(args->cmd[0], args->cmd, env.env);
+            ret = execve(args->cmd[0], args->cmd, env.env);
+            if (ret < 0) {
+                dprintf(STDERR_FILENO, "%s failed to exec %s with error %d\n", prefix, args->cmd[0], errno);
+                exit_status = 1;
+            } else {
+                exit_status = 0;
+            }
             env_destroy(&env);
+            exit(exit_status);
         }
         reader_reset(&reader);
     }
     reader_reset(&reader);
     free(prefix);
-    exit(EXIT_SUCCESS);
+    exit(exit_status);
 }
 
 // args
@@ -340,7 +370,7 @@ int reader_read(struct reader_t *reader) {
             reader->done = 1;
             if (errno != 0) {
                 reader->err = errno;
-                dprintf(STDERR_FILENO, "getline %d\n", errno);
+                dprintf(STDERR_FILENO, "%s getline %d\n", reader->prefix, errno);
             }
         }
     }
@@ -409,15 +439,15 @@ void worker_wait(pid_t pid, char *prefix, int verbose) {
     // parent
     pid_t wstatus;
     waitpid(pid, &wstatus, 0);
-    if (!verbose) return;
     if (WIFEXITED(wstatus)) {
-        dprintf(STDERR_FILENO, "%s pid %d exited with status %d\n", prefix, pid, WEXITSTATUS(wstatus));
+        if (verbose) dprintf(STDERR_FILENO, "%s pid %d exited with status %d\n", prefix, pid, WEXITSTATUS(wstatus));
     } else if (WIFSIGNALED(wstatus)) {
-        dprintf(STDERR_FILENO, "%s pid %d killed by signal %d%s\n", prefix, pid, WTERMSIG(wstatus), WCOREDUMP(wstatus) ? " (dumped core)" : "");
+        if (WCOREDUMP(wstatus)) dprintf(STDERR_FILENO, "%s pid %d killed by signal %d (dumped core)\n", prefix, pid, WTERMSIG(wstatus));
+        else if (verbose)       dprintf(STDERR_FILENO, "%s pid %d killed by signal %d\n", prefix, pid, WTERMSIG(wstatus));
     } else if (WIFSTOPPED(wstatus)) {
-        dprintf(STDERR_FILENO, "%s pid %d stopped by signal %d\n", prefix, pid, WSTOPSIG(wstatus));
+        if (verbose) dprintf(STDERR_FILENO, "%s pid %d stopped by signal %d\n", prefix, pid, WSTOPSIG(wstatus));
     } else if (WIFCONTINUED(wstatus)) {
-        dprintf(STDERR_FILENO, "%s pid %d continued\n", prefix, pid);
+        if (verbose) dprintf(STDERR_FILENO, "%s pid %d continued\n", prefix, pid);
     } else {
         dprintf(STDERR_FILENO, "%s pid %d exited with unknown status %d\n", prefix, pid, wstatus);
     }
