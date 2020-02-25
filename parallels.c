@@ -28,23 +28,28 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <sys/eventfd.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 // args
 
+#define EVENT_READY 1
+#define EVENT_INUSE 0
 #define NPROC_DEFAULT 8
 #define NPROC_MIN 2
 #define NPROC_MAX 64
 #define ENV_WORKER_ARG "WORKER_ARG"
 #define ENV_WORKER_PID "WORKER_PID"
 #define ENV_WORKER_INDEX "WORKER_INDEX"
+#define ENV_WORKER_EVENTFD "WORKER_EVENTFD"
 #define WORKER_ARG_BUFSIZE 1024
 #define WORKER_ARG_SIZE WORKER_ARG_BUFSIZE - strlen(ENV_WORKER_ARG) - 1 - 1
 
 struct args_t {
     int nproc;
     int nenv;
+    int worker;
     int verbose;
     char **cmd;
 };
@@ -58,7 +63,8 @@ int args_parse(int argc, char **argv, struct args_t *args);
 
 void worker_wait(pid_t pid, char *prefix, int verbose);
 void worker_start(struct args_t *args);
-void worker_child(struct args_t *args, int index);
+void worker_child(struct args_t *args, int index, int efd);
+void worker_child2(struct args_t *args, int index, int efd);
 
 // reader
 
@@ -87,7 +93,7 @@ struct env_t {
     char worker_arg[WORKER_ARG_BUFSIZE];
 };
 
-int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid, char *worker_arg);
+int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid);
 void env_destroy(struct env_t *env);
 void env_count(char **env, int *count);
 void env_show(char **env);
@@ -111,7 +117,7 @@ void show_usage(char *msg) {
     // buffer_size - worker_arg_name - equals_char - NUL
     dprintf(STDERR_FILENO,
             "%s"                                                                                \
-            "Usage: parallels [-n NUM_PROCESSES] [-v] -- CMD [ARG ...]\n"                       \
+            "Usage: parallels [-n NUM_PROCESSES] [-v] [-w] -- CMD [ARG ...]\n"                  \
             "\n"                                                                                \
             "Job runner that reads lines from STDIN and passes them to parallel worker\n"       \
             "processes that invoke a user-defined script against each line.\n"                  \
@@ -134,6 +140,8 @@ void show_usage(char *msg) {
             "     Indicates the integer number of worker processes\n"                           \
             "     Must be greater than or equal to %d and less than or equal to %d\n"           \
             "     Default is %d\n"                                                              \
+            "  -w\n"                                                                            \
+            "     Enable worker mode; worker is responsible to read line-by-line\n"             \
             "  -v\n"                                                                            \
             "     Enable verbose logging of worker activity to STDERR\n"                        \
             "  CMD\n"                                                                           \
@@ -153,71 +161,106 @@ void show_usage(char *msg) {
 
 // worker
 
+int write_efd(int fd, unsigned long long data) {
+    return write(fd, &data, sizeof (data));
+}
+
+int read_efd(int fd, unsigned long long *data) {
+    return read(fd, data, sizeof(unsigned long long));
+}
+
 void worker_start(struct args_t *args) {
     pid_t *worker_pids;
     int *worker_fds;
+    int *worker_efds;
     char *prefix = "main : ";
     struct reader_t reader;
     fd_set wfds, wfds2;
     int i, ret, nfds, last_i;
+    unsigned long long efd_data;
 
     FD_ZERO(&wfds);
     FD_ZERO(&wfds2);
     worker_pids = calloc(args->nproc, sizeof (pid_t));
     worker_fds = calloc(args->nproc, sizeof (int));
+    worker_efds = calloc(args->nproc, sizeof (int));
 
     for (i = 0; i < args->nproc; i++) {
-        int queue[2];
-        ret = pipe(queue);
-        if (args->verbose) dprintf(STDERR_FILENO, "%s starting worker %d...\n", prefix, i);
+        ret = eventfd(EVENT_INUSE, 0);          // setup worker eventfd
         if (ret == -1) {
-            dprintf(STDERR_FILENO, "%s starting worker %d failed with pipe error %d\n", prefix, i, errno);
+            dprintf(STDERR_FILENO, "%s starting worker %d failed with eventfd error %d\n", prefix, i, errno);
             break;
         }
-        worker_fds[i] = queue[1];
-        nfds = queue[1] + 1;
-        FD_SET(queue[1], &wfds);            // watch write fd
-        ret = fork();
-        if (ret < 0) {
-            dprintf(STDERR_FILENO, "%s starting worker %d failed with fork error %d\n", prefix, i, errno);
-            break;
+        worker_efds[i] = ret;
+        nfds = worker_efds[i] + 1;
+        FD_SET(worker_efds[i], &wfds);          // watch write fd
+    }
 
-        } else if (ret > 0) {
-            // parent
-            if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d forked with pid %d\n", prefix, i, ret);
-            close(queue[0]);                // close read fd
-            worker_pids[i] = ret;
+    if (ret >= 0) {
+        for (i = 0; i < args->nproc; i++) {
+            int queue[2];
+            int efd;
+            if (args->verbose) dprintf(STDERR_FILENO, "%s starting worker %d...\n", prefix, i);
+            ret = pipe(queue);                  // setup worker pipe
+            if (ret == -1) {
+                dprintf(STDERR_FILENO, "%s starting worker %d failed with pipe error %d\n", prefix, i, errno);
+                break;
+            }
+            efd = worker_efds[i];
+            worker_fds[i] = queue[1];
+            ret = fork();                       // start worker
+            if (ret < 0) {
+                dprintf(STDERR_FILENO, "%s starting worker %d failed with fork error %d\n", prefix, i, errno);
+                break;
 
-        } else {
-            // child
-            close(STDIN_FILENO);            // close stdin fd
-            dup2(queue[0], STDIN_FILENO);   // dup read fd to stdin fd
-            close(queue[1]);                // close write fd
-            close(queue[0]);                // close read fd
-            worker_child(args, i);
+            } else if (ret > 0) {
+                // parent
+                if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d forked with pid %d\n", prefix, i, ret);
+                close(queue[0]);                // close read fd
+                worker_pids[i] = ret;
+
+            } else {
+                // child
+                close(STDIN_FILENO);            // close stdin fd
+                dup2(queue[0], STDIN_FILENO);   // dup read fd to stdin fd
+                close(queue[1]);                // close write fd
+                close(queue[0]);                // close read fd
+                ret = write_efd(efd, EVENT_READY); // signal parent we are ready
+                if (ret < 0) {
+                    dprintf(STDERR_FILENO, "worker %d : failed on write eventfd %d\n", i, errno);
+                    exit(EXIT_FAILURE);
+                } else if (args->worker) {
+                    worker_child2(args, i, efd);
+                } else {
+                    worker_child(args, i, efd);
+                }
+            }
         }
     }
 
     if (ret >= 0) {
         // read stdin till EOF
         reader_init(&reader, prefix, stdin);
-        last_i = 0;
         while (!reader_read(&reader)) {                     // read line by line
             wfds2 = wfds;                                   // reset watched fds
-            ret = select(nfds, NULL, &wfds2, NULL, NULL);   // wait for available worker
+            ret = select(nfds, &wfds2, NULL, NULL, NULL);   // wait for available worker
             if (ret <= 0) {                                 // check for error or timeout
                 if (ret < 0) dprintf(STDERR_FILENO, "%s select got error %d\n", prefix, errno);  // we have an error while waiting
                 continue;
             }
             // worker available! find the worker...
-            for (i = 0; i < args->nproc; i++, last_i = (last_i++) % args->nproc) {
-                if (FD_ISSET(worker_fds[last_i], &wfds2)) {
-                    // found worker! write line to it...
-                    if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d write...\n", prefix, last_i);
-                    if (write(worker_fds[last_i], reader.line, reader.nread) == -1) {
-                        dprintf(STDERR_FILENO, "%s worker %d write error %d\n", prefix, last_i, errno);
+            for (i = 0; i < args->nproc; i++) {
+                if (FD_ISSET(worker_efds[i], &wfds2)) {
+                    // clear the status and prepare to write.
+                    if (read_efd(worker_efds[i], &efd_data) < 0) {
+                        dprintf(STDERR_FILENO, "%s worker %d read eventfd got error %d; skipping this line...\n", prefix, i, errno);
+                        break;
                     }
-                    last_i ++;
+                    // found worker! write line to it...
+                    if (args->verbose) dprintf(STDERR_FILENO, "%s worker %d write...\n", prefix, i);
+                    if (write(worker_fds[i], reader.line, reader.nread) == -1) {
+                        dprintf(STDERR_FILENO, "%s worker %d write error %d\n", prefix, i, errno);
+                    }
                     break;
                 }
             }
@@ -227,7 +270,7 @@ void worker_start(struct args_t *args) {
 
         // close write fds
         for (i = 0; i < args->nproc; i++) {
-            if (args->verbose)       dprintf(STDERR_FILENO, "%s worker %d close...\n", prefix, i);
+            if (args->verbose)              dprintf(STDERR_FILENO, "%s worker %d close...\n", prefix, i);
             if (close(worker_fds[i]) == -1) dprintf(STDERR_FILENO, "%s worker %d close error %d\n", prefix, i, errno);
         }
 
@@ -240,11 +283,34 @@ void worker_start(struct args_t *args) {
 
     free(worker_pids);
     free(worker_fds);
+    free(worker_efds);
 }
 
-void worker_child(struct args_t *args, int i) {
+void worker_child2(struct args_t *args, int i, int efd) {
+    struct env_t env;
+    int ret;
+    int exit_status;
+    int worker_pid;
+    char prefix[32];
+
+    worker_pid = getpid();
+    sprintf(prefix, "worker %d :", i);
+    env_init(&env, args->nenv, i, worker_pid);
+    sprintf(env.worker_arg, "%s=%d", ENV_WORKER_EVENTFD, efd);
+    ret = execvpe(args->cmd[0], args->cmd, env.env);
+    if (ret < 0) {
+        dprintf(STDERR_FILENO, "%s failed to exec %s with error %d\n", prefix, args->cmd[0], errno);
+        exit_status = 1;
+    } else {
+        exit_status = 0;
+    }
+    env_destroy(&env);
+    exit(exit_status);
+}
+
+void worker_child(struct args_t *args, int i, int efd) {
     struct reader_t reader;
-    char *prefix = calloc(32, sizeof (char));
+    char prefix[32];
     pid_t child, worker_pid;
     int ret, exit_status;
 
@@ -260,7 +326,15 @@ void worker_child(struct args_t *args, int i) {
             dprintf(STDERR_FILENO, "%s %s is too large (%ld bytes)\n", prefix, ENV_WORKER_ARG, strlen(reader.line));
             continue;
         }
-        env_init(&env, args->nenv, i, worker_pid, reader.line);
+        if (args->verbose) dprintf(STDERR_FILENO, "%s locking %d.\n", prefix, i);
+        ret = write_efd(efd, EVENT_INUSE);
+        if (ret < 0) {
+            dprintf(STDERR_FILENO, "%s write eventfd error %d\n", prefix, errno);
+            exit(EXIT_FAILURE);
+            return;
+        }
+        sprintf(env.worker_arg, "%s=%s", ENV_WORKER_ARG, reader.line);
+        env_init(&env, args->nenv, i, worker_pid);
         child = fork();
         if (child < 0) {
             dprintf(STDERR_FILENO, "%s fork error %d\n", prefix, errno);
@@ -278,9 +352,21 @@ void worker_child(struct args_t *args, int i) {
             exit(exit_status);
         }
         reader_reset(&reader);
+        if (args->verbose) dprintf(STDERR_FILENO, "%s unlocking %d.\n", prefix, i);
+        ret = write_efd(efd, EVENT_READY);
+        if (ret < 0) {
+            dprintf(STDERR_FILENO, "%s write eventfd error %d\n", prefix, errno);
+            exit(EXIT_FAILURE);
+            return;
+        }
+    }
+    ret = write_efd(efd, EVENT_READY);
+    if (ret < 0) {
+        dprintf(STDERR_FILENO, "%s write eventfd error %d\n", prefix, errno);
+        exit(EXIT_FAILURE);
+        return;
     }
     reader_reset(&reader);
-    free(prefix);
     exit(exit_status);
 }
 
@@ -291,6 +377,7 @@ void args_init(struct args_t *args, int argc) {
     args->cmd = calloc(argc - 1, sizeof (char *));
     args->nproc = NPROC_DEFAULT;
     env_count(__environ, &args->nenv);
+    args->worker = 0;
     args->verbose = 0;
 }
 
@@ -299,11 +386,12 @@ void args_destroy(struct args_t *args) {
 }
 
 void args_show(struct args_t *args) {
-    dprintf(STDERR_FILENO, "args.nproc : %d\n", args->nproc);
-    dprintf(STDERR_FILENO, "args.nenv  : %d\n", args->nenv);
+    dprintf(STDERR_FILENO, "args.nproc  : %d\n", args->nproc);
+    dprintf(STDERR_FILENO, "args.nenv   : %d\n", args->nenv);
+    dprintf(STDERR_FILENO, "args.worker : %d\n", args->worker);
     char **c;
     for (c = args->cmd; *c != NULL; c++) {
-        dprintf(STDERR_FILENO, "args.cmd   : %s\n", *c);
+        dprintf(STDERR_FILENO, "args.cmd    : %s\n", *c);
     }
 }
 
@@ -334,6 +422,11 @@ int args_parse(int argc, char **argv, struct args_t *args) {
                 show_usage("-n is invalid\n");
                 return -1;
             }
+
+        } else if (strcmp(argv[i], "-w") == 0) {
+            // we found worker
+            args->worker = 1;
+
         } else if (strcmp(argv[i], "-v") == 0) {
             // we found verbose
             args->verbose = 1;
@@ -400,7 +493,7 @@ void reader_show(struct reader_t *reader) {
 
 // env
 
-int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid, char *worker_arg) {
+int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid) {
     char **e;
     int i;
 
@@ -408,7 +501,6 @@ int env_init(struct env_t *env, int nenv, int worker_index, pid_t worker_pid, ch
     for (i = 0, e = __environ; *e != NULL; e++) {
         env->env[i++] = *e;
     }
-    sprintf(env->worker_arg, "%s=%s", ENV_WORKER_ARG, worker_arg);
     sprintf(env->worker_pid, "%s=%d", ENV_WORKER_PID, worker_pid);
     sprintf(env->worker_index, "%s=%d", ENV_WORKER_INDEX, worker_index);
     env->env[i++] = env->worker_arg;
